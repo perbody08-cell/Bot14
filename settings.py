@@ -1,53 +1,135 @@
-import os
-from pydantic_settings import BaseSettings
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+from sqlalchemy.ext.asyncio import AsyncSession
+from database.crud import get_or_create_user
+from sqlalchemy import select, and_
+from database.models import Contact
 
 
-class Settings(BaseSettings):
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/bot")
+async def contacts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню управления контактами (только для Business Mode)"""
 
-    def _normalize_database_url(self, url: str) -> str:
-        """Приводит Railway URL к формату, понятному SQLAlchemy + asyncpg."""
-        url = url.strip()
-        # Railway иногда даёт postgres:// вместо postgresql://
-        if url.startswith("postgres://"):
-            url = "postgresql" + url[len("postgres"):]
-        # Если asyncpg ещё не указан, добавляем его
-        if url.startswith("postgresql://") and "+asyncpg" not in url:
-            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return url
+    query = update.callback_query
+    await query.answer()
 
-    # LLM
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "mock")
-    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "claude-sonnet-4.6")
-    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "")
+    factory = context.bot_data["db_session_factory"]
+    session: AsyncSession = factory()
+    try:
+        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
 
-    # Modes
-    ENABLE_BUSINESS_MODE: bool = os.getenv("ENABLE_BUSINESS_MODE", "true").lower() == "true"
-    ENABLE_DIRECT_MODE: bool = os.getenv("ENABLE_DIRECT_MODE", "true").lower() == "true"
+        if not user.is_business_connected:
+            await query.edit_message_text(
+                "💼 Business Mode не подключён.\n\n"
+                "Подключите его в настройках Telegram Business, чтобы управлять контактами.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="settings")]])
+            )
+            return
 
-    # Settings
-    MAX_CONTEXT_MESSAGES: int = int(os.getenv("MAX_CONTEXT_MESSAGES", "20"))
-    DEFAULT_PROMPT_ID: int = int(os.getenv("DEFAULT_PROMPT_ID", "1"))
+        result = await session.execute(
+            select(Contact).where(Contact.owner_id == user.id).order_by(Contact.created_at.desc()).limit(20)
+        )
+        contacts = result.scalars().all()
 
-    # Admin — необязательно, по умолчанию пустой список
-    ADMIN_IDS: list[int] = []
+        if not contacts:
+            text = "👥 У вас пока нет контактов.\n\nКонтакты появятся автоматически, когда кто-то напишет вам."
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="settings")]]
+        else:
+            text = "👥 Ваши контакты (Business Mode):\n\n"
+            keyboard = []
+            for c in contacts:
+                status = "🟢" if c.is_active else "🔴"
+                name = c.first_name or c.username or f"ID:{c.telegram_user_id}"
+                text += f"{status} {name} ({c.relationship_type})\n"
+                keyboard.append([InlineKeyboardButton(
+                    f"{status} {name}",
+                    callback_data=f"contact_{c.id}"
+                )])
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Приводим DATABASE_URL к формату asyncpg (важно для Railway)
-        self.DATABASE_URL = self._normalize_database_url(self.DATABASE_URL)
-        # Парсим ADMIN_IDS вручную
-        admin_ids_str = os.getenv("ADMIN_IDS", "")
-        if admin_ids_str:
-            try:
-                self.ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
-            except ValueError:
-                self.ADMIN_IDS = []
+            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings")])
 
-    class Config:
-        env_file = ".env"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    finally:
+        await session.close()
 
 
-settings = Settings()
+async def contact_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Детали контакта"""
+
+    query = update.callback_query
+    await query.answer()
+
+    contact_id = int(query.data.split("_")[1])
+
+    factory = context.bot_data["db_session_factory"]
+    session: AsyncSession = factory()
+    try:
+        # Проверяем принадлежность контакта текущему пользователю (защита от IDOR)
+        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
+        result = await session.execute(
+            select(Contact).where(
+                and_(Contact.id == contact_id, Contact.owner_id == user.id)
+            )
+        )
+        contact = result.scalar_one_or_none()
+
+        if not contact:
+            await query.edit_message_text("Контакт не найден или недостаточно прав.")
+            return
+
+        name = contact.first_name or contact.username or f"ID:{contact.telegram_user_id}"
+
+        text = (
+            f"👤 {name}\n\n"
+            f"Отношения: {contact.relationship_type}\n"
+            f"Статус: {'🟢 Бот отвечает' if contact.is_active else '🔴 Бот отключён'}\n"
+            f"Заметки: {contact.notes or 'Нет'}\n"
+            f"Извлечённый стиль: {contact.extracted_style or 'Не анализировался'}"
+        )
+
+        keyboard = [
+            [InlineKeyboardButton(
+                "🔴 Отключить бота" if contact.is_active else "🟢 Включить бота",
+                callback_data=f"toggle_contact_{contact.id}"
+            )],
+            [InlineKeyboardButton("🏷️ Тип отношений", callback_data=f"rel_contact_{contact.id}")],
+            [InlineKeyboardButton("📝 Заметки", callback_data=f"notes_contact_{contact.id}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="contacts")]
+        ]
+
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    finally:
+        await session.close()
+
+
+async def toggle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включить/отключить бота для контакта"""
+
+    query = update.callback_query
+    await query.answer()
+
+    contact_id = int(query.data.split("_")[2])
+
+    factory = context.bot_data["db_session_factory"]
+    session: AsyncSession = factory()
+    try:
+        # Проверяем принадлежность контакта текущему пользователю (защита от IDOR)
+        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
+        result = await session.execute(
+            select(Contact).where(
+                and_(Contact.id == contact_id, Contact.owner_id == user.id)
+            )
+        )
+        contact = result.scalar_one_or_none()
+
+        if not contact:
+            await query.edit_message_text("Контакт не найден или недостаточно прав.")
+            return
+
+        from database.crud import update_contact
+        await update_contact(session, contact_id, is_active=not contact.is_active)
+    finally:
+        await session.close()
+
+    # Перезагружаем детали контакта
+    update.callback_query.data = f"contact_{contact_id}"
+    await contact_detail(update, context)

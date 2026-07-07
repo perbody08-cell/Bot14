@@ -1,175 +1,134 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, BigInteger, Float
-from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import declarative_base, relationship
-from datetime import datetime
+from telegram import Update
+from telegram.ext import ContextTypes
+from sqlalchemy.ext.asyncio import AsyncSession
+from database.crud import (
+    get_or_create_user, get_or_create_direct_chat, get_direct_chat_history,
+    add_direct_message, update_direct_chat
+)
+from services.llm import get_llm
+from services.prompt_builder import PromptBuilder
+from settings import settings
+import logging
 
-Base = declarative_base()
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, unique=True, nullable=False)
-    username = Column(String(100))
-    first_name = Column(String(100))
-    last_name = Column(String(100))
-
-    # Business Mode
-    business_connection_id = Column(String(255), unique=True)
-    is_business_connected = Column(Boolean, default=False)
-
-    # Direct Mode (общение с ботом)
-    direct_mode_enabled = Column(Boolean, default=True)
-    direct_persona = Column(Text)  # Персона для прямого общения
-
-    # Настройки
-    chosen_prompt_id = Column(Integer, ForeignKey("prompts.id"), default=1)
-    custom_prompt = Column(Text)
-    global_knowledge = Column(JSON, default=dict)
-
-    # LLM
-    llm_provider = Column(String(50), default="mock")
-    llm_api_key = Column(String(500))
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    contacts = relationship("Contact", back_populates="owner", lazy="selectin")
-    chat_sessions = relationship("ChatSession", back_populates="owner", lazy="selectin")
-    direct_chats = relationship("DirectChat", back_populates="user", lazy="selectin")
-    prompt = relationship("Prompt", lazy="selectin")
+logger = logging.getLogger(__name__)
 
 
-class Contact(Base):
-    __tablename__ = "contacts"
+async def handle_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик прямых сообщений пользователю боту (не Business)"""
 
-    id = Column(Integer, primary_key=True)
-    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    if not settings.ENABLE_DIRECT_MODE:
+        return
 
-    telegram_user_id = Column(BigInteger)
-    username = Column(String(100))
-    first_name = Column(String(100))
-    last_name = Column(String(100))
-    phone = Column(String(50))
+    # Пропускаем команды
+    if update.message and update.message.text and update.message.text.startswith("/"):
+        return
 
-    relationship_type = Column(String(50), default="unknown")
-    notes = Column(Text)
-    extracted_style = Column(JSON, default=dict)
+    # Пропускаем сообщения из Business Connection
+    if update.business_message:
+        return
 
-    is_active = Column(Boolean, default=True)
-    use_custom_prompt = Column(Boolean, default=False)
-    custom_prompt = Column(Text)
+    # Работаем только в личных чатах
+    if update.effective_chat.type != "private":
+        return
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    factory = context.bot_data["db_session_factory"]
+    session: AsyncSession = factory()
+    try:
+        # Получаем или создаём пользователя
+        user = await get_or_create_user(
+            session,
+            telegram_id=update.effective_user.id,
+            username=update.effective_user.username,
+            first_name=update.effective_user.first_name,
+            last_name=update.effective_user.last_name
+        )
 
-    owner = relationship("User", back_populates="contacts")
-    messages = relationship("Message", back_populates="contact", lazy="selectin")
+        # Проверяем, включён ли Direct Mode
+        if not user.direct_mode_enabled:
+            return
 
+        # Получаем или создаём direct чат
+        chat = await get_or_create_direct_chat(session, user.id)
 
-class ChatSession(Base):
-    __tablename__ = "chat_sessions"
+        # Сохраняем сообщение пользователя
+        await add_direct_message(
+            session,
+            chat_id=chat.id,
+            sender_type="user",
+            text=update.message.text or ""
+        )
 
-    id = Column(Integer, primary_key=True)
-    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    contact_id = Column(Integer, ForeignKey("contacts.id"))
-    chat_id = Column(BigInteger, nullable=False)
+        # Показываем typing
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action="typing"
+        )
 
-    session_type = Column(String(20), default="business")  # business, direct
-    is_active = Column(Boolean, default=True)
-    last_message_at = Column(DateTime)
+        # Получаем историю
+        history = await get_direct_chat_history(session, chat.id, limit=settings.MAX_CONTEXT_MESSAGES)
+        history_dicts = [{"sender_type": h.sender_type, "text": h.text} for h in history]
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+        # Строим промпт
+        system_prompt = PromptBuilder.build_direct_prompt(
+            user=user,
+            chat=chat,
+            prompt=user.prompt
+        )
+        messages = PromptBuilder.build_messages(history_dicts, update.message.text or "")
 
-    owner = relationship("User", back_populates="chat_sessions")
-    messages = relationship("Message", back_populates="session", lazy="selectin")
+        # Генерируем ответ
+        llm = get_llm(user.llm_provider, user.llm_api_key)
 
+        try:
+            response_text = await llm.generate(
+                system_prompt,
+                messages,
+                mode="direct",
+                user_settings={"user_id": user.id, "chat_id": chat.id}
+            )
 
-class DirectChat(Base):
-    """Прямое общение пользователя с ботом (не Business)"""
-    __tablename__ = "direct_chats"
+            # Отправляем ответ
+            await update.message.reply_text(response_text)
 
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+            # Сохраняем ответ бота
+            await add_direct_message(
+                session,
+                chat_id=chat.id,
+                sender_type="bot",
+                text=response_text,
+                llm_model=user.llm_provider
+            )
 
-    # Настройки персоны для этого чата
-    persona_name = Column(String(100), default="Помощник")
-    persona_description = Column(Text)
-    system_prompt = Column(Text)
-
-    # Контекст
-    context_summary = Column(Text)  # Сводка предыдущих разговоров
-
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    user = relationship("User", back_populates="direct_chats")
-    messages = relationship("DirectMessage", back_populates="chat", lazy="selectin")
-
-
-class Message(Base):
-    __tablename__ = "messages"
-
-    id = Column(Integer, primary_key=True)
-    session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=False)
-    contact_id = Column(Integer, ForeignKey("contacts.id"))
-
-    sender_type = Column(String(20), nullable=False)  # owner, contact, bot
-    text = Column(Text)
-
-    tokens_input = Column(Integer)
-    tokens_output = Column(Integer)
-    llm_model = Column(String(100))
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    session = relationship("ChatSession", back_populates="messages")
-    contact = relationship("Contact", back_populates="messages")
-
-
-class DirectMessage(Base):
-    """Сообщения в прямом чате с ботом"""
-    __tablename__ = "direct_messages"
-
-    id = Column(Integer, primary_key=True)
-    chat_id = Column(Integer, ForeignKey("direct_chats.id"), nullable=False)
-
-    sender_type = Column(String(20), nullable=False)  # user, bot
-    text = Column(Text)
-
-    tokens_input = Column(Integer)
-    tokens_output = Column(Integer)
-    llm_model = Column(String(100))
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    chat = relationship("DirectChat", back_populates="messages")
+        except Exception as e:
+            logger.error(f"Direct LLM Error: {e}", exc_info=True)
+            await update.message.reply_text(
+                "⚠️ Произошла ошибка при генерации ответа. Попробуйте позже."
+            )
+    finally:
+        await session.close()
 
 
-class Prompt(Base):
-    __tablename__ = "prompts"
+async def direct_mode_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Информация о Direct Mode"""
 
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), nullable=False)
-    description = Column(Text)
-    system_prompt = Column(Text, nullable=False)
-    category = Column(String(50), default="business")  # business, direct, universal
-    is_custom = Column(Boolean, default=False)
-    is_active = Column(Boolean, default=True)
+    query = update.callback_query
+    await query.answer()
 
-    created_at = Column(DateTime, default=datetime.utcnow)
+    text = (
+        "🤖 Direct Mode — общение с ботом\n\n"
+        "В этом режиме вы просто общаетесь со мной как с AI-ассистентом.\n\n"
+        "💡 Возможности:\n"
+        "• Задавайте любые вопросы\n"
+        "• Просите помочь с задачами\n"
+        "• Обсуждайте идеи\n"
+        "• Практикуйте языки\n"
+        "• Получайте советы\n\n"
+        "⚙️ Настройки:\n"
+        "• Выберите стиль общения\n"
+        "• Настройте свою персону\n"
+        "• Укажите интересы для персонализации\n\n"
+        "💼 Также доступен Business Mode — бот будет отвечать от вашего имени в личных чатах через Telegram Business."
+    )
 
-    users = relationship("User", back_populates="prompt")
-
-
-class BusinessConnectionLog(Base):
-    __tablename__ = "business_connection_logs"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    business_connection_id = Column(String(255))
-    action = Column(String(50))
-    details = Column(JSON)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    from keyboards.inline import main_menu_keyboard
+    await query.edit_message_text(text, reply_markup=main_menu_keyboard())
