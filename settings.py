@@ -33,19 +33,25 @@ class Settings(BaseSettings):
     MAX_CONTEXT_MESSAGES: int = int(os.getenv("MAX_CONTEXT_MESSAGES", "20"))
     DEFAULT_PROMPT_ID: int = int(os.getenv("DEFAULT_PROMPT_ID", "1"))
 
-    # Admin — храним как строку, чтобы Pydantic не ругался на тип из Railway.
-    # Парсим в список int через свойство get_admin_ids().
-    ADMIN_IDS: str = ""
+    # Admin — необязательно, по умолчанию пустой список
+    ADMIN_IDS: list[int] = []
 
-    @property
-    def get_admin_ids(self) -> list[int]:
-        """Возвращает ADMIN_IDS как список int."""
-        if not self.ADMIN_IDS:
+    @field_validator("ADMIN_IDS", mode="before")
+    @classmethod
+    def _parse_admin_ids(cls, v: Any) -> list[int]:
+        """Принимает список, одно число или строку через запятую."""
+        if v is None or v == "":
             return []
-        try:
-            return [int(x.strip()) for x in str(self.ADMIN_IDS).split(",") if x.strip()]
-        except ValueError:
-            return []
+        if isinstance(v, int):
+            return [v]
+        if isinstance(v, list):
+            return [int(x) for x in v if x is not None]
+        if isinstance(v, str):
+            try:
+                return [int(x.strip()) for x in v.split(",") if x.strip()]
+            except ValueError:
+                return []
+        return []
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
