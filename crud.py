@@ -6,6 +6,17 @@ class Settings(BaseSettings):
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/bot")
 
+    def _normalize_database_url(self, url: str) -> str:
+        """Приводит Railway URL к формату, понятному SQLAlchemy + asyncpg."""
+        url = url.strip()
+        # Railway иногда даёт postgres:// вместо postgresql://
+        if url.startswith("postgres://"):
+            url = "postgresql" + url[len("postgres"):]
+        # Если asyncpg ещё не указан, добавляем его
+        if url.startswith("postgresql://") and "+asyncpg" not in url:
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return url
+
     # LLM
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "mock")
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
@@ -25,6 +36,8 @@ class Settings(BaseSettings):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # Приводим DATABASE_URL к формату asyncpg (важно для Railway)
+        self.DATABASE_URL = self._normalize_database_url(self.DATABASE_URL)
         # Парсим ADMIN_IDS вручную
         admin_ids_str = os.getenv("ADMIN_IDS", "")
         if admin_ids_str:
