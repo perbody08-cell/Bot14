@@ -1,228 +1,163 @@
+from telegram import Update
+from telegram.ext import ContextTypes
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, and_, func
-from database.models import (
-    User, Contact, ChatSession, DirectChat, DirectMessage,
-    Message, Prompt, BusinessConnectionLog
+from database.crud import (
+    get_user_by_business_conn, get_or_create_contact, get_or_create_chat_session,
+    get_chat_history, add_message, log_business_connection
 )
-from typing import Optional, List
+from services.llm import get_llm
+from services.prompt_builder import PromptBuilder
+from settings import settings
 
 
-async def get_or_create_user(session: AsyncSession, telegram_id: int, **kwargs) -> User:
-    result = await session.execute(select(User).where(User.telegram_id == telegram_id))
-    user = result.scalar_one_or_none()
+async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик сообщений из Business Connection"""
 
-    if not user:
-        user = User(telegram_id=telegram_id, **kwargs)
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
+    if not update.business_message:
+        return
 
-    return user
+    if not settings.ENABLE_BUSINESS_MODE:
+        return
 
+    business_msg = update.business_message
+    business_conn_id = business_msg.business_connection_id
 
-async def get_user_by_business_conn(session: AsyncSession, connection_id: str) -> Optional[User]:
-    result = await session.execute(
-        select(User).where(User.business_connection_id == connection_id)
-    )
-    return result.scalar_one_or_none()
+    factory = context.bot_data["db_session_factory"]
+    session: AsyncSession = factory()
+    try:
+        user = await get_user_by_business_conn(session, business_conn_id)
 
+        if not user:
+            return
 
-async def update_business_connection(session: AsyncSession, user_id: int, connection_id: str):
-    result = await session.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one()
-    user.business_connection_id = connection_id
-    user.is_business_connected = True
-    await session.commit()
-
-
-async def get_or_create_contact(session: AsyncSession, owner_id: int, telegram_user_id: int, **kwargs) -> Contact:
-    result = await session.execute(
-        select(Contact).where(
-            and_(Contact.owner_id == owner_id, Contact.telegram_user_id == telegram_user_id)
+        # Инфо о контакте (кто пишет владельцу)
+        contact_user = business_msg.from_user
+        contact = await get_or_create_contact(
+            session,
+            owner_id=user.id,
+            telegram_user_id=contact_user.id,
+            username=contact_user.username,
+            first_name=contact_user.first_name,
+            last_name=contact_user.last_name
         )
-    )
-    contact = result.scalar_one_or_none()
 
-    if not contact:
-        contact = Contact(owner_id=owner_id, telegram_user_id=telegram_user_id, **kwargs)
-        session.add(contact)
-        await session.commit()
-        await session.refresh(contact)
+        if not contact.is_active:
+            return
 
-    return contact
-
-
-async def get_or_create_chat_session(session: AsyncSession, owner_id: int, chat_id: int, 
-                                     contact_id: Optional[int] = None, session_type: str = "business") -> ChatSession:
-    result = await session.execute(
-        select(ChatSession).where(
-            and_(ChatSession.owner_id == owner_id, ChatSession.chat_id == chat_id)
+        chat_session = await get_or_create_chat_session(
+            session,
+            owner_id=user.id,
+            chat_id=business_msg.chat.id,
+            contact_id=contact.id,
+            session_type="business"
         )
-    )
-    session_obj = result.scalar_one_or_none()
 
-    if not session_obj:
-        session_obj = ChatSession(
-            owner_id=owner_id, 
-            chat_id=chat_id, 
-            contact_id=contact_id,
-            session_type=session_type
+        # Сохраняем входящее
+        await add_message(
+            session,
+            session_id=chat_session.id,
+            sender_type="contact",
+            text=business_msg.text or "",
+            contact_id=contact.id
         )
-        session.add(session_obj)
-        await session.commit()
-        await session.refresh(session_obj)
 
-    return session_obj
+        # Получаем историю
+        history = await get_chat_history(session, chat_session.id, limit=settings.MAX_CONTEXT_MESSAGES)
+        history_dicts = [{"sender_type": h.sender_type, "text": h.text} for h in history]
 
-
-async def get_or_create_direct_chat(session: AsyncSession, user_id: int) -> DirectChat:
-    result = await session.execute(
-        select(DirectChat).where(
-            and_(DirectChat.user_id == user_id, DirectChat.is_active == True)
+        # Строим промпт
+        system_prompt = PromptBuilder.build_business_prompt(
+            user=user,
+            contact=contact,
+            prompt=user.prompt
         )
-    )
-    chat = result.scalar_one_or_none()
+        messages = PromptBuilder.build_messages(history_dicts, business_msg.text or "")
 
-    if not chat:
-        chat = DirectChat(user_id=user_id)
-        session.add(chat)
+        # Генерируем ответ
+        llm = get_llm(user.llm_provider, user.llm_api_key)
+
+        try:
+            response_text = await llm.generate(
+                system_prompt,
+                messages,
+                mode="business",
+                user_settings={"user_id": user.id, "contact_id": contact.id}
+            )
+
+            # Отправляем от имени владельца
+            await context.bot.send_message(
+                chat_id=business_msg.chat.id,
+                text=response_text,
+                business_connection_id=business_conn_id
+            )
+
+            # Сохраняем ответ
+            await add_message(
+                session,
+                session_id=chat_session.id,
+                sender_type="bot",
+                text=response_text,
+                contact_id=contact.id,
+                llm_model=user.llm_provider
+            )
+
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Business LLM Error: {e}", exc_info=True)
+
+        from datetime import datetime
+        chat_session.last_message_at = datetime.utcnow()
         await session.commit()
-        await session.refresh(chat)
-
-    return chat
-
-
-async def get_chat_history(session: AsyncSession, session_id: int, limit: int = 20) -> List[Message]:
-    result = await session.execute(
-        select(Message)
-        .where(Message.session_id == session_id)
-        .order_by(desc(Message.created_at))
-        .limit(limit)
-    )
-    return list(reversed(result.scalars().all()))
+    finally:
+        await session.close()
 
 
-async def get_direct_chat_history(session: AsyncSession, chat_id: int, limit: int = 20) -> List[DirectMessage]:
-    result = await session.execute(
-        select(DirectMessage)
-        .where(DirectMessage.chat_id == chat_id)
-        .order_by(desc(DirectMessage.created_at))
-        .limit(limit)
-    )
-    return list(reversed(result.scalars().all()))
+async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка подключения/отключения Business Connection"""
 
+    if not update.business_connection:
+        return
 
-async def add_message(session: AsyncSession, session_id: int, sender_type: str, text: str, 
-                      contact_id: Optional[int] = None, tokens_input: int = 0, 
-                      tokens_output: int = 0, llm_model: str = "") -> Message:
-    msg = Message(
-        session_id=session_id,
-        contact_id=contact_id,
-        sender_type=sender_type,
-        text=text,
-        tokens_input=tokens_input,
-        tokens_output=tokens_output,
-        llm_model=llm_model
-    )
-    session.add(msg)
-    await session.commit()
-    await session.refresh(msg)
-    return msg
+    conn = update.business_connection
 
+    factory = context.bot_data["db_session_factory"]
+    session: AsyncSession = factory()
+    try:
+        from database.crud import get_or_create_user, update_business_connection
 
-async def add_direct_message(session: AsyncSession, chat_id: int, sender_type: str, text: str,
-                             tokens_input: int = 0, tokens_output: int = 0, 
-                             llm_model: str = "") -> DirectMessage:
-    msg = DirectMessage(
-        chat_id=chat_id,
-        sender_type=sender_type,
-        text=text,
-        tokens_input=tokens_input,
-        tokens_output=tokens_output,
-        llm_model=llm_model
-    )
-    session.add(msg)
-    await session.commit()
-    await session.refresh(msg)
-    return msg
+        user = await get_or_create_user(
+            session,
+            telegram_id=conn.user_chat_id,
+            first_name=conn.user.first_name if conn.user else None
+        )
 
+        if conn.is_enabled:
+            await update_business_connection(session, user.id, conn.id)
+            await log_business_connection(session, user.id, conn.id, "connected", {
+                "can_reply": conn.can_reply,
+                "user_chat_id": conn.user_chat_id
+            })
 
-async def get_prompts(session: AsyncSession, category: Optional[str] = None) -> List[Prompt]:
-    query = select(Prompt).where(Prompt.is_active == True)
-    if category:
-        query = query.where(Prompt.category == category)
-    result = await session.execute(query)
-    return result.scalars().all()
+            await context.bot.send_message(
+                chat_id=conn.user_chat_id,
+                text=(
+                    "✅ Business-аккаунт подключен!\n\n"
+                    "Бот теперь будет отвечать на сообщения от вашего имени в личных чатах.\n\n"
+                    "📋 Что настроить:\n"
+                    "• Стиль ответов — как бот будет писать от вашего имени\n"
+                    "• База знаний — информация о вас для правдоподобных ответов\n"
+                    "• Контакты — для кого включить/выключить автоответ\n\n"
+                    "⚠️ Сейчас работает в тестовом режиме (заглушка LLM)."
+                )
+            )
+        else:
+            await log_business_connection(session, user.id, conn.id, "disconnected")
+            user.is_business_connected = False
+            await session.commit()
 
-
-async def get_prompt_by_id(session: AsyncSession, prompt_id: int) -> Optional[Prompt]:
-    result = await session.execute(select(Prompt).where(Prompt.id == prompt_id))
-    return result.scalar_one_or_none()
-
-
-async def update_user_prompt(session: AsyncSession, user_id: int, prompt_id: int):
-    result = await session.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one()
-    user.chosen_prompt_id = prompt_id
-    await session.commit()
-
-
-async def update_user_knowledge(session: AsyncSession, user_id: int, knowledge: dict):
-    result = await session.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one()
-    user.global_knowledge = knowledge
-    await session.commit()
-
-
-async def update_contact(session: AsyncSession, contact_id: int, **kwargs):
-    result = await session.execute(select(Contact).where(Contact.id == contact_id))
-    contact = result.scalar_one()
-    for key, value in kwargs.items():
-        setattr(contact, key, value)
-    await session.commit()
-
-
-async def update_direct_chat(session: AsyncSession, chat_id: int, **kwargs):
-    result = await session.execute(select(DirectChat).where(DirectChat.id == chat_id))
-    chat = result.scalar_one()
-    for key, value in kwargs.items():
-        setattr(chat, key, value)
-    await session.commit()
-
-
-async def get_user_stats(session: AsyncSession, user_id: int) -> dict:
-    contacts_count = await session.execute(
-        select(func.count(Contact.id)).where(Contact.owner_id == user_id)
-    )
-    messages_count = await session.execute(
-        select(func.count(Message.id))
-        .join(ChatSession)
-        .where(ChatSession.owner_id == user_id)
-    )
-    sessions_count = await session.execute(
-        select(func.count(ChatSession.id)).where(ChatSession.owner_id == user_id)
-    )
-    direct_messages = await session.execute(
-        select(func.count(DirectMessage.id))
-        .join(DirectChat)
-        .where(DirectChat.user_id == user_id)
-    )
-
-    return {
-        "contacts": contacts_count.scalar(),
-        "messages": messages_count.scalar(),
-        "sessions": sessions_count.scalar(),
-        "direct_messages": direct_messages.scalar()
-    }
-
-
-async def log_business_connection(session: AsyncSession, user_id: int, connection_id: str, 
-                                  action: str, details: dict = None):
-    log = BusinessConnectionLog(
-        user_id=user_id,
-        business_connection_id=connection_id,
-        action=action,
-        details=details or {}
-    )
-    session.add(log)
-    await session.commit()
+            await context.bot.send_message(
+                chat_id=conn.user_chat_id,
+                text="❌ Business-аккаунт отключен. Бот больше не отвечает за вас."
+            )
+    finally:
+        await session.close()
